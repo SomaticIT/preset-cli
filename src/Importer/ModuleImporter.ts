@@ -1,7 +1,7 @@
 import vm from 'vm';
 import path from 'path';
 import fs from 'fs-extra';
-import { transformSync } from 'esbuild';
+import { buildSync, transformSync } from 'esbuild';
 import { inject, injectable } from 'inversify';
 import { Binding, Bus, color, ExecutionError, getPackage, ImporterContract, Preset } from '@/exports';
 
@@ -13,10 +13,11 @@ export class ModuleImporter implements ImporterContract {
   async import(directory: string): Promise<Preset> {
     this.bus.debug(`Importing preset at ${color.magenta(directory)}.`);
 
-    const script = fs.readFileSync(this.findConfiguration(directory)).toString();
+    const filename = this.findConfiguration(directory);
+    const script = fs.readFileSync(filename).toString();
     const sanitizedScript = this.removeSelfImportStatement(script);
 
-    return await this.evaluateConfiguration(sanitizedScript);
+    return await this.evaluateConfiguration(sanitizedScript, directory, filename);
   }
 
   /**
@@ -73,20 +74,11 @@ export class ModuleImporter implements ImporterContract {
   /**
    * Evaluates the configuration and returns the preset.
    */
-  protected async evaluateConfiguration(script: string): Promise<Preset> {
+  protected async evaluateConfiguration(script: string, directory: string, filename: string): Promise<Preset> {
     try {
-      const context = vm.createContext({
-        exports: {},
-        require,
-        module,
-        Preset: new Preset(),
-        color,
-      });
+      const context = vm.createContext(this.createContext(directory, filename));
 
-      const { code } = transformSync(script, {
-        loader: 'ts',
-        format: 'cjs',
-      });
+      const code = this.transformScript(script, directory, filename);
       vm.runInContext(code, context);
 
       return context.Preset as Preset;
@@ -115,5 +107,79 @@ export class ModuleImporter implements ImporterContract {
         return true;
       })
       .join('\n');
+  }
+
+  protected transformScript(contents: string, resolveDir: string, sourcefile: string): string {
+    if (contents.includes('import ')) {
+      const { outputFiles } = buildSync({
+        stdin: {
+          contents,
+          resolveDir,
+          sourcefile,
+          loader: 'ts',
+        },
+        platform: 'node',
+        format: 'cjs',
+        external: ['apply'],
+        bundle: true,
+        write: false,
+      });
+
+      return outputFiles[0].text;
+    }
+
+    const { code } = transformSync(contents, {
+      loader: 'ts',
+      format: 'cjs',
+    });
+
+    return code;
+  }
+
+  protected createContext(directory: string, filename: string): Record<string, any> {
+    const exports = {};
+    const moduleGlobals = {
+      exports,
+      require,
+      module: {
+        exports,
+        filename,
+        id: filename,
+        path: directory,
+        require: module.require,
+      },
+      __dirname: directory,
+      __filename: filename,
+    };
+
+    const nodeGlobals = {
+      Buffer,
+      clearImmediate,
+      clearInterval,
+      clearTimeout,
+      console,
+      global,
+      process,
+      queueMicrotask,
+      setImmediate,
+      setInterval,
+      setTimeout,
+      // These globals are not available in TypeScript because they live in DOM.d.ts lib
+      // which is not included in tsconfig.json (to be strict and avoid errors).
+      // Is there a way to import only a subset of the DOM lib?
+      // TextDecoder,
+      // TextEncoder
+      // URL,
+      // URLSearchParams,
+      // WebAssembly
+    };
+
+    return {
+      ...moduleGlobals,
+      ...nodeGlobals,
+
+      Preset: new Preset(),
+      color,
+    };
   }
 }
